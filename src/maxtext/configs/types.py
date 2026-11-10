@@ -1717,6 +1717,16 @@ class DeepSeekMoE(BaseModel):
   routed_score_func: str = Field("", description="Scoring function for routing (e.g., 'softmax', 'sigmoid').")
   routed_bias: bool = Field(False, description="Whether to add a bias term for routing.")
   routed_bias_update_rate: float = Field(0.0, description="Update rate applied to the router bias term.")
+  moe_quantile_balancing: bool = Field(
+      False, description="Collect global-step QB histograms and update Kimi-K3 router biases."
+  )
+  moe_qb_num_bins: PositiveInt = Field(1000, description="Uniform histogram bins per expert for Quantile Balancing.")
+  moe_qb_histogram_mode: Literal["fused_atomic", "two_kernel"] = Field(
+      "fused_atomic", description="TE QB histogram mode."
+  )
+  moe_qb_mask_padding: bool = Field(
+      True, description="Exclude sequence padding from QB; disabling requires synthetic data."
+  )
   defer_small_all_reduces: bool = Field(
       False,
       description="Ring-of-experts sparse_matmul only: drop the per-layer all-reduces of the routed-bias expert counts"
@@ -4575,6 +4585,31 @@ class MaxTextConfig(
           f"check_vma=True only supports ici_expert_parallelism and ici_fsdp_parallelism. "
           f"Found other ICI axes enabled: {active}."
       )
+
+  @model_validator(mode="after")
+  def validate_quantile_balancing(self):
+    if not self.moe_quantile_balancing:
+      return self
+    if self.decoder_block != DecoderBlockType.KIMI_LINEAR or not self.model_name.startswith("kimi-k3"):
+      raise ValueError("moe_quantile_balancing currently supports the Kimi-K3 decoder.")
+    if not self.routed_bias or self.routed_score_func != "sigmoid" or not self.float32_gate_logits:
+      raise ValueError("QB requires routed_bias=true, routed_score_func=sigmoid and float32_gate_logits=true.")
+    if self.load_balance_loss_weight != 0 or self.routed_bias_update_rate != 0:
+      raise ValueError("QB replaces auxiliary load-balancing losses and sign-based bias updates; set both rates to zero.")
+    if self.n_routing_groups > 0 or self.topk_routing_group > 0 or self.use_random_routing:
+      raise ValueError("QB requires ungrouped, non-random routing.")
+    if not 0 < self.num_experts_per_tok < self.num_experts:
+      raise ValueError("QB requires 0 < num_experts_per_tok < num_experts.")
+    if not self.moe_qb_mask_padding and self.dataset_type != DatasetType.SYNTHETIC:
+      raise ValueError("moe_qb_mask_padding=false is only supported for synthetic data.")
+    if self.te_moe_block and self.routed_experts_weight_format != "bf16":
+      raise ValueError("TE MoE requires dense expert weights; dequantize MXFP4 checkpoints on load.")
+    if self.use_tunix_gradient_accumulation:
+      raise ValueError("QB is integrated with the native MaxText gradient accumulation loop.")
+    if self.global_batch_size_to_train_on is not None:
+      if self.global_batch_size_to_train_on * self.max_target_length >= 2**31:
+        raise ValueError("QB int32 histograms require fewer than 2**31 tokens per global step.")
+    return self
 
   def validate_moe_dropless_fallback(self):
     """Validates prerequisites for the step-level ('step') and in-layer ('layer') dropless fallback."""

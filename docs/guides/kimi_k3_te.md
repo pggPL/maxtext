@@ -1,91 +1,114 @@
-# Kimi-K3 with TE MoEBlock
+# Kimi-K3 training with Transformer Engine MoE
 
-This integration is based on Google's Kimi-K3 stack through PR #6178,
-`f9cfba05aa09885417e6b107fd3a90d74d339956`, which includes #5550 and adds
-scanned decoder layers. It requires the TE changes in
-[pggPL/TransformerEngine#73](https://github.com/pggPL/TransformerEngine/pull/73)
-and [#74](https://github.com/pggPL/TransformerEngine/pull/74); the head of #74
-contains both changes.
+This integration combines Google's Kimi-K3 text architecture, tokenizer,
+checkpoint conversion, scanned decoder and selectable KDA implementation with
+Transformer Engine's routed MoE path and global-step Quantile Balancing (QB).
+It is a draft implementation. Compilation, numerical parity, checkpoint
+continuation, memory use and performance have not been validated.
 
-Enable `te_moe_block=true` with the existing `model_name=kimi-k3`. The Google
-KDA, gated NoPE MLA, Attention Residuals, dense/shared SiTU MLPs, latent
-projections and post-combine RMSNorm remain unchanged. TE computes the routing,
-EP dispatch/combine, grouped expert GEMMs and their backward pass.
+The Google integration base contains these pinned PR heads:
 
-## Model contract
+| PR | Commit | Feature |
+| --- | --- | --- |
+| #5550 | `06659ec278f8281bcfabf2df5531159f61eb3958` | BF16 decoder |
+| #5551 | `9e05bf81431affcca031cf0a2fe6175823ab4ce7` | Kimi tokenizer |
+| #5542 | `5679fabe4a45735219b7b98477b2a69d213e5ba3` | MXFP4 conversion / dequantize-on-load |
+| #6014 | `7fd77aab5ec0c5bf64a881016b4f63e3dd91fad0` | Optional tokamax KDA |
+| #6178 | `a35bcb3fe08d3a3bf4601eb638fb44db3c1e49aa` | Scanned decoder and checkpoint mapping |
 
-- The router reads the original hidden state (7168 at production width) in
-  FP32; experts read the separately projected latent (3584). Router weights
-  retain the full hidden width.
-- Routed experts use the actual two-branch SiTU: `4*tanh(gate/4)*sigmoid(gate)`
-  times `25*tanh(up/25)`, evaluated in FP32 before casting back. There is no
-  SwiGLU replacement.
-- Unbiased sigmoid scores are normalized over the selected experts. The
-  correction bias affects selection only. Weights are applied after the expert
-  down projection, before combine.
-- `prefuse_moe_weights=false` preserves Google's separate `wi_0` and `wi_1`
-  parameter names and shapes. The adapter concatenates their values for TE;
-  gradients return through the concatenate. Checkpoint round-trip execution
-  remains to be validated.
-- With `quantization=''`, only the routed experts create TE quantizers.
-  `te_gmm_quantization=te_no_quant` selects the BF16 baseline; `te_mxfp8` is an
-  optional lower-precision execution mode.
+## TE dependency
 
-Older TE versions fail with an actionable error when separate router inputs or
-two-branch SiTU are unavailable. The adapter never substitutes an approximate
-model or silently falls back to native routing.
+Use the stack [TE #73](https://github.com/pggPL/TransformerEngine/pull/73)
+→ [#74](https://github.com/pggPL/TransformerEngine/pull/74)
+→ [#75](https://github.com/pggPL/TransformerEngine/pull/75), including token-mask
+support. The pinned TE revision is
+`ee66c66ec2e2205f59b4a0d7f1f1dbd89dce0130`; it is also recorded in
+`tests/end_to_end/gpu/kimi/te_revision.txt`. Build TE JAX from that revision in
+an appropriate GPU container before running this code. An older TE installation
+fails explicitly when a required capability is missing.
 
-The exact contract here is the architecture and forward/gradient mathematics of
-the Google baseline, subject to the selected numerical precision. This change
-does not implement missing parts of the published training recipe. In
-particular, Google's static correction bias remains static; quantile-balancing
-updates and load-balance auxiliary loss propagation are not added. Google's
-packing, autoregressive decode, context/pipeline-parallel limitations also
-remain. Full official-checkpoint and full-model validation are pending.
+The router reads the full FP32 hidden state, while experts process the latent.
+TE applies SiTU with caps 4/25 on both FFN branches and applies routing weights
+late. MaxText retains separate `wi_0`/`wi_1` checkpoint parameters and concatenates
+them only for the TE call. KDA, gated NoPE MLA, Attention Residuals, latent
+projections, post-expert RMSNorm and shared experts follow the Google model.
 
-## Prepared runs
+## Quantile Balancing
 
-Inside an installed MaxText environment with the head of TE #74 and
-`test-maxtext.sh` on PATH:
+`kimi-k3.yml` enables `moe_quantile_balancing=true`. Biases are non-optimizer
+`MoEBiasVar` state and remain fixed throughout a full gradient-accumulation step.
+Each valid token contributes a sample for every expert. Histograms are collected
+without an auxiliary load-balancing loss. The next bias is recovered from the
+pooled global-batch quantile and mean-centered, then used on the following step.
+Empty batches/layers and rejected skip-step optimizer updates preserve the old
+bias. Evaluation does not collect statistics or update biases. Checkpoints
+persist the bias, while histogram intermediates are discarded.
+
+The native router uses a JAX/LAX histogram with bounded token chunks. This is a
+portable baseline, including TPU; its distributed performance is unmeasured.
+The TE path returns per-token-shard histograms. MaxText accumulates them in the
+microbatch scan carry and reduces them once after the full step, rather than
+stacking a histogram for every microbatch or averaging local quantiles.
+
+`moe_qb_num_bins=1000` controls the histogram resolution. TE also accepts
+`moe_qb_histogram_mode=fused_atomic` or `two_kernel`.
+`moe_qb_mask_padding=true` excludes tokens with input segment ID zero. When a
+mask is supplied, TE computes routing/cutoff and JAX collects the masked histogram
+from the saved scores; the no-mask path uses the CUDA histogram kernels directly.
+Disabling masking is restricted to synthetic data. QB requires sigmoid FP32
+routing, no routing groups, zero `load_balance_loss_weight`, and zero
+`routed_bias_update_rate`. Tunix gradient accumulation is not integrated.
+
+## GPU configuration
+
+Select `model_name=kimi-k3 te_moe_block=true`, with:
+
+```text
+quantization= te_gmm_quantization=te_no_quant
+sparse_matmul=true megablox=false prefuse_moe_weights=false
+use_ring_of_experts=false ragged_buffer_factor=0.0
+moe_quantile_balancing=true
+```
+
+`te_gmm_quantization=te_mxfp8` opts into MXFP8 grouped GEMMs for routed experts.
+This is distinct from the released MXFP4 weight format. Imported MXFP4 weights
+must be dequantized into dense training parameters for this TE path. Google's
+packed MXFP4 runtime remains available for native inference/parity; it is not
+trainable and is not native MXFP4 grouped GEMM/QAT support in TE.
+
+`run_te_exact.sh` is a local multi-process launcher. Set `GPUS` explicitly; `EP`
+defaults to 2 and must divide `GPUS`. The model dimensions default to the released
+93 layers and 896 experts/top16. That full model requires a large memory budget;
+this script does not select suitable hardware or establish that it fits. Use the
+normal multi-node MaxText launcher for a large distributed allocation.
+
+For an explicitly smaller synthetic workload, after build and validation:
 
 ```bash
-bash tests/end_to_end/gpu/kimi/run_te_exact.sh
-# 4 GPUs, EP=2/FSDP=2, 4 layers, 32 experts, top-16, production widths,
-# sequence 1024, batch 1/GPU, 20 BF16 steps on synthetic data.
-
-GPUS=2 MAX_TARGET_LENGTH=128 STEPS=5 \
-  bash tests/end_to_end/gpu/kimi/run_te_exact.sh
-
-MOE_PARITY=1 bash tests/end_to_end/gpu/kimi/run_te_exact.sh
-
-SCAN_LAYERS=true LAYERS=13 \
+GPUS=4 LAYERS=4 EXPERTS=32 GRADIENT_ACCUMULATION_STEPS=2 \
   bash tests/end_to_end/gpu/kimi/run_te_exact.sh
 ```
 
-The default is a reduced training slice with the same building blocks, not a
-full-model memory-fit claim. `LAYERS=93 EXPERTS=896` selects the released layer
-layout and expert count; the launcher derives the MLA indices from the Google
-layout. Such a run requires a separately planned hardware allocation.
+The launcher uses BF16, synthetic data, sequence length 1024 by default and
+`moe_qb_mask_padding=false`; configuration rejects that mask override if the
+input pipeline is changed to real data. `SCAN_LAYERS=true` selects scanned
+execution. `DRY_RUN=1` prints the command without launching it. The smaller
+workload changes model size and is not the complete released model.
 
-`DRY_RUN=1` prints the command. `OUTPUT`, `COORDINATOR_PORT`, `BATCH_PER_GPU`,
-`FULL_ATTN_LAYERS`, `TE_GMM_QUANTIZATION` and `EXTRA_MAXTEXT_ARGS` provide
-overrides. For smaller component validation, `MOE_PARITY=1` uses a 256-wide
-hidden state, 128-wide latent and 8 experts while retaining full-width routing,
-two-branch SiTU, RMSNorm, latent projections and a shared SiTU expert.
+## Validation to run later
 
-Worst-case receive capacity (`ragged_buffer_factor<=0`) is required because the
-Google latent block does not propagate TE's overflow metadata to the trainer.
-This keeps the path dropless without adding an architectural change.
+Prepared checks cover standalone histogram/quantile math, token masking,
+microbatch additivity, empty/rejected updates, persistent bias state, native
+latent MoE output parity, gradient accumulation and scanned layer statistics.
+TE #75 prepares the corresponding GPU router/MoE tests. None were executed
+while preparing this draft. The existing `check_te_exact_moe.py` also compares
+latent MoE outputs and all parameter/input gradients against a BF16 oracle.
 
-## Validation status
-
-Execution is deferred at the user's request. No model, numerical test, build,
-GPU allocation or CI run has been performed for this integration. Source and
-shell syntax, formatting and diff checks are recorded separately.
-
-The prepared component check compares BF16 outputs and every parameter/input
-gradient against a native oracle with nonzero selection bias and scaling. It
-also checks the full-width router and split expert parameter storage. The
-existing TE tests cover the separate-input and SiTU primitives; all runtime
-checks still need to be run. Scanned/unscanned model parity, rematerialization,
-MXFP8 and checkpoint continuation remain follow-up validation.
+Full-model HF logit parity, masked TE integration, scan/remat, checkpoint
+continuation and MXFP8 remain to be executed. The inherited Google limitations
+still apply: no autoregressive KDA state cache, no Kimi pipeline/context
+parallelism, and packed sequences require the configured tokamax segment path.
+This is a text-backbone integration, without the vision encoder/projector or
+an implementation of the original Per-Head Muon training recipe. The optional
+Tokamax Mosaic KDA path is TPU-specific; a dedicated optimized GPU KDA kernel
+is not supplied here.

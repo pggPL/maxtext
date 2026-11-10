@@ -46,6 +46,7 @@ from maxtext.kernels.ragged.ragged_sort_tc import ring_ragged_sort_tc
 from maxtext.kernels.ragged.ragged_sort_tc import ring_ragged_unsort_tc
 from maxtext.kernels.ragged.ragged_sort_tc import tc_buffer_row_weights
 from maxtext.layers import attentions, linears, nnx_wrappers, quantizations
+from maxtext.layers import quantile_balancing as qb
 from maxtext.layers.initializers import NdInitializer, default_bias_init, nd_dense_init
 from maxtext.utils import max_logging
 from maxtext.utils import max_utils
@@ -1415,7 +1416,8 @@ class RoutedMoE(nnx.Module):
         router_probs = jax.nn.softmax(gate_logits.astype(jnp.float32), axis=-1)
         top_k_weights = jnp.take_along_axis(router_probs, gather_indices, axis=-1).astype(self.dtype)
       else:
-        top_k_weights = jnp.take_along_axis(gate_logits, gather_indices, axis=-1)
+        routing_scores = pre_bias_logits if qb.enabled(self.config) else gate_logits
+        top_k_weights = jnp.take_along_axis(routing_scores, gather_indices, axis=-1)
     else:
       if self.config.use_random_routing:
         if rngs is None:
@@ -5117,6 +5119,8 @@ class RoutedMoE(nnx.Module):
       wo_bias: jax.Array | None,
       out_sharding: NamedSharding | None = None,
       router_input: jax.Array | None = None,
+      collect_qb: bool = False,
+      qb_token_mask: jax.Array | None = None,
   ) -> tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]:
     """Run TransformerEngine's fused EP MoEBlock using MaxText-owned params."""
     try:
@@ -5174,6 +5178,18 @@ class RoutedMoE(nnx.Module):
         aux_loss_coeff=self.config.load_balance_loss_weight,
         gate_kernel_axes=self.kernel_axes,
     )
+    if collect_qb:
+      if not hasattr(te_moe, "RouterComputationInfo"):
+        raise ValueError("Kimi QB requires TE PR #75 including token-mask support.")
+      parameters = inspect.signature(te_moe.RouterComputationInfo).parameters
+      if "qb_bin_bounds" not in parameters or "qb_token_mask" not in parameters:
+        raise ValueError("Kimi QB requires TE PR #75 including token-mask support.")
+      router_kwargs.update(
+          qb_bin_bounds=qb.bin_bounds(expert_bias),
+          qb_token_mask=qb_token_mask,
+          qb_num_bins=self.config.moe_qb_num_bins,
+          qb_histogram_mode=self.config.moe_qb_histogram_mode,
+      )
     te_parameters = inspect.signature(te_moe.moe).parameters
     if router_input is not None:
       if (
@@ -5205,7 +5221,7 @@ class RoutedMoE(nnx.Module):
         raise ValueError("Installed TE MoEBlock lacks two-branch SiTU support; upgrade TE.")
       activation_type = te_moe.SiTUActivation()
 
-    output, lb_loss, total_recv_tokens, *_ = te_moe.moe(
+    result = te_moe.moe(
         inputs,
         wi=wi_kernel,
         wo=wo_kernel,
@@ -5226,6 +5242,11 @@ class RoutedMoE(nnx.Module):
         **cudnn_gmm_fusion_kwargs,
         **checkpoint_kwargs,
     )
+    output, lb_loss, total_recv_tokens = result[:3]
+    if collect_qb:
+      if len(result) != 5:
+        raise ValueError("TE QB must return per-shard histograms as its fifth result.")
+      qb.record(self, result[4])
     recv_capacity_per_rank = max_utils.get_te_moe_recv_capacity_per_rank()
     output = output.astype(self.dtype)
     if lb_loss is not None:
@@ -5241,6 +5262,8 @@ class RoutedMoE(nnx.Module):
       gate_inputs: jax.Array | None = None,
       out_sharding: NamedSharding | None = None,
       forced_routed_experts: jax.Array | None = None,
+      collect_qb: bool = False,
+      qb_token_mask: jax.Array | None = None,
   ) -> tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]:
     """Executes the routed MoE block.
 
@@ -5257,6 +5280,15 @@ class RoutedMoE(nnx.Module):
     """
     cfg = self.config
     inputs = inputs.astype(cfg.dtype)
+
+    if collect_qb:
+      if not qb.enabled(cfg):
+        raise ValueError("collect_qb requires moe_quantile_balancing=true.")
+      if forced_routed_experts is not None:
+        raise ValueError("QB does not support forced debug routes.")
+      if qb_token_mask is not None:
+        if qb_token_mask.shape != inputs.shape[:-1] or qb_token_mask.dtype != jnp.bool_:
+          raise ValueError("QB token mask must be boolean with the input batch/sequence shape.")
 
     if gate_inputs is None and self.moe_router_input_dim != self.moe_expert_input_dim:
       raise ValueError(
@@ -5296,9 +5328,21 @@ class RoutedMoE(nnx.Module):
           wo_bias,
           out_sharding,
           router_input=routing_inputs if gate_inputs is not None else None,
+          collect_qb=collect_qb,
+          qb_token_mask=qb_token_mask,
       )
 
     gate_logits, pre_bias_logits = self.gate(routing_inputs)
+    if collect_qb:
+      forced_routed_experts, counts = qb.route_and_observe(
+          gate_logits,
+          pre_bias_logits,
+          self.gate.bias.value,
+          qb_token_mask,
+          self.num_experts_per_tok,
+          cfg.moe_qb_num_bins,
+      )
+      qb.record(self, counts)
 
     is_fused_moe_path = cfg.attention in ("vllm_rpa", "vllm_batched_rpa") and not self.is_hash_routing
 

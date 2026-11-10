@@ -18,13 +18,13 @@ export DECOUPLE_GCLOUD=TRUE
 export NVTE_JAX_ENFORCE_V2_GROUPED_GEMM=1
 export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
 
-GPUS="${GPUS:-4}"
-case "$GPUS" in
-  2) EP=2; FSDP=1 ;;
-  4) EP=2; FSDP=2 ;;
-  *) echo 'Use GPUS=2 or GPUS=4; TE EP requires at least two processes.' >&2; exit 2 ;;
-esac
-LAYERS="${LAYERS:-4}"
+GPUS="${GPUS:?Set GPUS to the number of local GPU processes}"
+EP="${EP:-2}"
+if ! [[ "$GPUS" =~ ^[0-9]+$ && "$EP" =~ ^[0-9]+$ ]] || (( EP < 2 || GPUS < EP || GPUS % EP != 0 )); then
+  echo 'GPUS must be a positive multiple of EP, with EP>=2.' >&2; exit 2
+fi
+FSDP=$((GPUS / EP))
+LAYERS="${LAYERS:-93}"
 if ! [[ "$LAYERS" =~ ^[0-9]+$ ]] || (( LAYERS < 2 || LAYERS > 93 )); then
   echo 'LAYERS must be between 2 and 93; layer 0 alone does not exercise MoE.' >&2
   exit 2
@@ -38,7 +38,10 @@ if [[ -z "$FULL_ATTN_LAYERS" ]]; then
 fi
 OUTPUT="${OUTPUT:-${MAXTEXT_DIR}/outputs/kimi_te_exact_$(date +%Y%m%d_%H%M%S)}"
 EXTRA="override_model_config=true te_moe_block=true
-base_num_decoder_layers=$LAYERS full_attn_layers=$FULL_ATTN_LAYERS num_experts=${EXPERTS:-32}
+base_num_decoder_layers=$LAYERS full_attn_layers=$FULL_ATTN_LAYERS num_experts=${EXPERTS:-896}
+moe_quantile_balancing=${MOE_QB:-true} moe_qb_num_bins=${QB_BINS:-1000}
+moe_qb_histogram_mode=${QB_HISTOGRAM_MODE:-fused_atomic} moe_qb_mask_padding=false
+gradient_accumulation_steps=${GRADIENT_ACCUMULATION_STEPS:-1}
 quantization= te_gmm_quantization=${TE_GMM_QUANTIZATION:-te_no_quant}
 sparse_matmul=true megablox=false prefuse_moe_weights=false use_ring_of_experts=false
 ici_expert_parallelism=$EP ici_fsdp_parallelism=$FSDP ici_data_parallelism=1
@@ -52,7 +55,7 @@ CMD=(test-maxtext.sh --multiprocess -n 1 -b "${BATCH_PER_GPU:-1}"
   --model-name=kimi-k3 --attn-type=dot_product --remat-policy=full
   --steps="${STEPS:-20}" --data-parallel=1 --fsdp=1 --tensor-parallel=1
   --tensor-sequence-parallel=1 --mem-fraction 0.85 --output "$OUTPUT" -a "$EXTRA")
-printf 'Kimi-K3 + TE: full-width router, two-branch SiTU. EP=%s FSDP=%s\n' "$EP" "$FSDP"
+printf 'Kimi-K3 + TE: full-width router, two-branch SiTU, global-step QB. EP=%s FSDP=%s\n' "$EP" "$FSDP"
 if [[ "${MOE_PARITY:-0}" == 1 ]]; then
   CMD=(python3 "$MAXTEXT_DIR/tests/end_to_end/gpu/kimi/check_te_exact_moe.py")
 fi

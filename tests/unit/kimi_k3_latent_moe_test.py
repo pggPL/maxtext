@@ -195,6 +195,7 @@ class KimiK3LatentMoETest(unittest.TestCase):
     """A real kimi-k3 HyperParameters at this test's toy MoE dims (RoutedMoE needs one)."""
     kwargs = {
         "override_model_config": True,
+        "moe_quantile_balancing": False,
         "base_emb_dim": self.hidden_size,
         "base_num_decoder_layers": 2,
         "full_attn_layers": [1],
@@ -259,6 +260,78 @@ class KimiK3LatentMoETest(unittest.TestCase):
         rngs=nnx.Rngs(0),
     )
     return block, cfg, mesh
+
+  def test_qb_statistics_do_not_change_forward_and_update_only_at_step_boundary(self):
+    from maxtext.layers import quantile_balancing as qb
+
+    block, cfg, mesh = self._make_block(moe_quantile_balancing=True, moe_qb_num_bins=32, sparse_matmul=False)
+    x = jax.random.normal(jax.random.PRNGKey(94), (self.batch_size, self.seq_len, self.hidden_size))
+    mask = jnp.arange(self.batch_size * self.seq_len).reshape(self.batch_size, self.seq_len) % 2 == 0
+    original_bias = block.routed_experts.gate.bias.value
+    with mesh:
+      expected = block(x)
+      template = qb.empty_histograms(block, cfg)
+      actual = block(x, collect_qb=True, qb_token_mask=mask)
+      stats = qb.extract(nnx.pop(block, qb.QBHistogram))
+      np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+      self.assertEqual(set(stats), set(template))
+      for path, counts in stats.items():
+        self.assertEqual(counts.shape, template[path].shape)
+        np.testing.assert_array_equal(counts.sum(axis=(0, 2)), np.full(self.num_experts, np.asarray(mask).sum()))
+      np.testing.assert_array_equal(block.routed_experts.gate.bias.value, original_bias)
+      qb.apply_updates(block, stats, cfg.num_experts_per_tok)
+      np.testing.assert_allclose(block.routed_experts.gate.bias.value.sum(), 0.0, atol=1e-7)
+
+  def test_qb_gradient_accumulation_matches_whole_batch_histogram(self):
+    from jax.sharding import NamedSharding, PartitionSpec
+    from maxtext.layers import quantile_balancing as qb
+    from maxtext.utils.gradient_accumulation import gradient_accumulation_loss_and_grad
+
+    block, cfg, mesh = self._make_block(
+        moe_quantile_balancing=True,
+        moe_qb_num_bins=32,
+        sparse_matmul=False,
+        gradient_accumulation_steps=2,
+        per_device_batch_size=2 * self.batch_size,
+    )
+    x = jax.random.normal(jax.random.PRNGKey(95), (2 * self.batch_size, self.seq_len, self.hidden_size))
+    mask = jnp.arange(x.shape[0] * self.seq_len).reshape(x.shape[:2]) % 3 != 0
+    bias_before = block.routed_experts.gate.bias.value
+
+    def loss_fn(model, config, data, dropout_rng, params, is_train=True):
+      del config, dropout_rng, params, is_train
+      y = model(data["inputs"], collect_qb=True, qb_token_mask=data["valid"])
+      histograms = qb.extract(nnx.pop(model, qb.QBHistogram))
+      total = jnp.sum(y.astype(jnp.float32) ** 2)
+      return total, {
+          "xent_sum": total,
+          "total_weights": jnp.asarray(y.size, jnp.float32),
+          "moe_lb_loss": jnp.asarray(0.0),
+          "indexer_loss": jnp.asarray(0.0),
+          "mtp_loss": jnp.asarray(0.0),
+          "qb_histograms": histograms,
+      }
+
+    with mesh:
+      expected = block(x, collect_qb=True, qb_token_mask=mask)
+      expected_histograms = qb.extract(nnx.pop(block, qb.QBHistogram))
+      shardings = jax.tree.map(lambda _: NamedSharding(mesh, PartitionSpec()), nnx.state(block, nnx.Param))
+      loss, aux, grads = gradient_accumulation_loss_and_grad(
+          loss_fn,
+          cfg,
+          block,
+          None,
+          shardings,
+          {"inputs": x, "valid": mask},
+          None,
+      )
+      np.testing.assert_allclose(loss, jnp.mean(expected.astype(jnp.float32) ** 2), rtol=1e-5, atol=1e-5)
+      self.assertEqual(set(aux["qb_histograms"]), set(expected_histograms))
+      for path, counts in aux["qb_histograms"].items():
+        self.assertEqual(counts.shape, expected_histograms[path].shape)
+        np.testing.assert_array_equal(counts, expected_histograms[path])
+      np.testing.assert_array_equal(block.routed_experts.gate.bias.value, bias_before)
+      self.assertTrue(all(np.isfinite(np.asarray(g)).all() for g in jax.tree.leaves(grads)))
 
   def _make_mxfp4_experts(self):
     """`KimiMxfp4RoutedExperts` at this test's dims (intermediate 32: MXFP4 groups are 32 wide)."""

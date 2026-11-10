@@ -450,6 +450,9 @@ class KimiLatentMoEBlock(nnx.Module):
       self,
       hidden_states: Array,
       out_sharding: Optional[NamedSharding] = None,
+      *,
+      collect_qb: bool = False,
+      qb_token_mask: Optional[Array] = None,
   ) -> Array:
     """Forward pass of KimiLatentMoEBlock.
 
@@ -468,7 +471,9 @@ class KimiLatentMoEBlock(nnx.Module):
     if isinstance(self.routed_experts, moe.RoutedMoE):
       # Down-project to the latent (7168 -> 3584); the router reads the full hidden state.
       x_latent = self.routed_expert_down_proj(hidden_states)
-      y_routed, _, _ = self.routed_experts(x_latent, gate_inputs=hidden_states)
+      y_routed, _, _ = self.routed_experts(
+          x_latent, gate_inputs=hidden_states, collect_qb=collect_qb, qb_token_mask=qb_token_mask
+      )
     else:
       x_flat = hidden_states.reshape(-1, orig_shape[-1])
       x_latent = self.routed_expert_down_proj(x_flat)
