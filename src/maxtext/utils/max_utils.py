@@ -337,6 +337,9 @@ def initialize_jax_for_gpu(raw_keys):
     if devices is not None:
       try:
         devices = [int(x) for x in devices.split(",")]
+        if env_var == "CUDA_VISIBLE_DEVICES":
+          # CUDA renumbers visible devices from zero.
+          devices = list(range(len(devices)))
       except (ValueError, TypeError) as e:
         max_logging.log(f"Error parsing {env_var}: {e}")
         devices = None

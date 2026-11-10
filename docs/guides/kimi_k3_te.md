@@ -3,8 +3,9 @@
 This integration combines Google's Kimi-K3 text architecture, tokenizer,
 checkpoint conversion, scanned decoder and selectable KDA implementation with
 Transformer Engine's routed MoE path and global-step Quantile Balancing (QB).
-It is a draft implementation. Compilation, numerical parity, checkpoint
-continuation, memory use and performance have not been validated.
+It remains a draft. A small synthetic BF16 workload has been built, checked
+and profiled on four GB200 GPUs. Full-model numerical parity, checkpoint
+continuation and memory requirements remain unvalidated.
 
 The Google integration base contains these pinned PR heads:
 
@@ -95,17 +96,25 @@ input pipeline is changed to real data. `SCAN_LAYERS=true` selects scanned
 execution. `DRY_RUN=1` prints the command without launching it. The smaller
 workload changes model size and is not the complete released model.
 
-## Validation to run later
+## Validation status
 
 Prepared checks cover standalone histogram/quantile math, token masking,
 microbatch additivity, empty/rejected updates, persistent bias state, native
 latent MoE output parity, gradient accumulation and scanned layer statistics.
-TE #75 prepares the corresponding GPU router/MoE tests. None were executed
-while preparing this draft. The existing `check_te_exact_moe.py` also compares
-latent MoE outputs and all parameter/input gradients against a BF16 oracle.
+On 2026-11-10, 26 TE QB router tests passed on GPU. The six histogram/state
+math tests, three native MoE/GA/scan QB tests and six GPU-initialization unit
+tests passed on CPU. The `check_te_exact_moe.py` BF16 oracle passed on four
+GPUs: relative RMS error was 0.67% for outputs and at most 1.17% for gradients,
+within its existing 3% tolerance.
 
-Full-model HF logit parity, masked TE integration, scan/remat, checkpoint
-continuation and MXFP8 remain to be executed. The inherited Google limitations
+A four-layer/32-expert synthetic training workload completed with QB enabled
+and without capacity overflow. Separate runs covered a small 13-layer scanned
+model with gradient accumulation of two and masked QB. These proxy checks do
+not establish full-model correctness. The launcher now maps CUDA-visible
+devices to local ordinals and terminates sibling ranks after a failure.
+
+Full-model HF logit parity, wider distributed coverage, checkpoint
+continuation and MXFP8 training remain to be executed. The inherited Google limitations
 still apply: no autoregressive KDA state cache, no Kimi pipeline/context
 parallelism, and packed sequences require the configured tokamax segment path.
 This is a text-backbone integration, without the vision encoder/projector or

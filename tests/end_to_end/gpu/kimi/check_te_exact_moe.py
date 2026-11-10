@@ -23,6 +23,7 @@ from flax import nnx
 from flax.core.spmd import logical_axis_rules
 import jax
 import jax.numpy as jnp
+from transformer_engine.jax.sharding import MeshResource, global_shard_guard
 
 from maxtext.configs import pyconfig
 from maxtext.layers.latent_moe import KimiLatentMoEBlock
@@ -98,7 +99,8 @@ def main():
       base_output_directory="/tmp/kimi-te-exact-parity",
   )
   mesh = jax.sharding.Mesh(maxtext_utils.create_device_mesh(cfg), cfg.mesh_axes)
-  with jax.set_mesh(mesh), logical_axis_rules(cfg.logical_axis_rules):
+  resources = MeshResource(dp_resource="data", fsdp_resource="fsdp", ep_resource="expert")
+  with global_shard_guard(resources), jax.set_mesh(mesh), logical_axis_rules(cfg.logical_axis_rules):
     max_utils.maybe_bootstrap_te_moe(cfg, mesh, {"inputs": jax.ShapeDtypeStruct((processes, 16), jnp.int32)})
 
     def create():

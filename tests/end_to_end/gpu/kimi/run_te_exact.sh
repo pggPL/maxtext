@@ -87,6 +87,8 @@ for (( rank=0; rank<GPUS; rank++ )); do
   PIDS+=("$!")
 done
 FAILED=0
-for pid in "${PIDS[@]}"; do if ! wait "$pid"; then FAILED=1; cleanup; fi; done
+for (( completed=0; completed<GPUS; completed++ )); do
+  if ! wait -n; then FAILED=1; cleanup; break; fi
+done
 printf 'exit=%s\n' "$FAILED" > "$OUTPUT/status.txt"
 exit "$FAILED"
