@@ -285,11 +285,11 @@ class TestGpuDistributedInitialization(unittest.TestCase):
   @mock.patch("jax.devices")
   @mock.patch("maxtext.utils.max_logging.log")
   def test_initialize_jax_for_gpu_valid_devices(self, _mock_log, _mock_devices, mock_init):
-    """Verifies that a comma-separated string of IDs is correctly parsed."""
+    """CUDA-visible device IDs are remapped to local ordinals."""
     raw_keys = {"jax_distributed_initialization_timeout": 300}
     max_utils.initialize_jax_for_gpu(raw_keys)
     _, kwargs = mock_init.call_args
-    self.assertEqual(kwargs["local_device_ids"], [0, 2, 3])
+    self.assertEqual(kwargs["local_device_ids"], [0, 1, 2])
     self.assertEqual(kwargs["coordinator_address"], "10.0.0.1:1234")
 
   @mock.patch.dict(
@@ -382,7 +382,7 @@ class TestGpuDistributedInitialization(unittest.TestCase):
     raw_keys = {"jax_distributed_initialization_timeout": 300}
     max_utils.initialize_jax_for_gpu(raw_keys)
     _, kwargs = mock_init.call_args
-    self.assertEqual(kwargs["local_device_ids"], [0, 2])
+    self.assertEqual(kwargs["local_device_ids"], [0, 1])
     mock_log.assert_any_call("Using CUDA_VISIBLE_DEVICES to initialize JAX distributed system: 0,2")
 
 

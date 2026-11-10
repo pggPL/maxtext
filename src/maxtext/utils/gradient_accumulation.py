@@ -23,6 +23,7 @@ from flax import nnx
 
 from maxtext.common.common_types import ShardMode
 from maxtext.layers.moe import load_balance_updates_from_counts
+from maxtext.layers import quantile_balancing as qb
 from maxtext.utils import max_utils
 from maxtext.utils.sharding import maybe_shard_with_name
 
@@ -88,6 +89,10 @@ def gradient_accumulation_loss_and_grad(
   else:
     ga_params_shardings = grad_shardings = params_shardings
 
+  qb_active = qb.enabled(config) and is_nnx
+  qb_template = qb.empty_histograms(model, config) if qb_active else {}
+  if qb_active:
+    nnx.pop(model, qb.QBHistogram)
   if is_nnx:
     graphdef, params, rest = nnx.split(model, nnx.Param, ...)
 
@@ -147,6 +152,11 @@ def gradient_accumulation_loss_and_grad(
       )
       with loop_unroll_ctx:
         (_, aux), cur_batch_gradient = grad_func(model, config, data, rng, ga_params, is_train=True)
+    if qb_active:
+      current_histograms = aux.pop("qb_histograms")
+      acc_grad_and_loss["qb_histograms"] = jax.tree.map(
+          lambda total, current: total + current, acc_grad_and_loss["qb_histograms"], current_histograms
+      )
     acc_grad_and_loss["loss"] += aux["xent_sum"] + aux.get("dpo_loss", 0.0)
     acc_grad_and_loss["moe_lb_loss"] += aux["moe_lb_loss"]
     acc_grad_and_loss["indexer_loss"] += aux["indexer_loss"]
@@ -174,6 +184,8 @@ def gradient_accumulation_loss_and_grad(
       "mtp_loss": 0.0,
       "ga_params": ga_params,
   }
+  if qb_active:
+    init_grad_and_loss["qb_histograms"] = qb_template
   if is_nnx:
     init_grad_and_loss["rest_state"] = rest  # pyrefly: ignore[unbound-name]
 
@@ -202,6 +214,8 @@ def gradient_accumulation_loss_and_grad(
       lambda arr: jnp.where(has_weights, (arr / divisor).astype(arr.dtype), jnp.zeros_like(arr)),
       raw_grads,
   )
+  if qb_active:
+    final_qb_histograms = grad_and_loss["qb_histograms"]
   scanned_aux = aux
   aux = jax.tree.map(lambda x: jnp.sum(x, axis=0), aux)  # pytype: disable=module-attr
   # The auxiliary losses are per-microbatch means; the step's value is their mean over microbatches (as in `loss`
@@ -238,6 +252,8 @@ def gradient_accumulation_loss_and_grad(
     aux["moe_max_load_ratio"] = jnp.max(scanned_aux["moe_max_load_ratio"], axis=0)
     aux["moe_max_load_ratio_mean"] = jnp.mean(scanned_aux["moe_max_load_ratio_mean"], axis=0)
 
+  if qb_active:
+    aux["qb_histograms"] = final_qb_histograms
   if is_nnx:
     nnx.update(model, grad_and_loss["rest_state"])
 

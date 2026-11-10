@@ -52,6 +52,7 @@ def _toy_config(**overrides):
   """A 13-layer kimi-k3 at toy scale (fp32 so parity is tight)."""
   kwargs = {
       "override_model_config": True,
+      "moe_quantile_balancing": False,
       "base_emb_dim": _EMB_DIM,
       "base_num_decoder_layers": _NUM_LAYERS,
       "full_attn_layers": _FULL_ATTN_LAYERS,
@@ -348,3 +349,32 @@ class KimiK3ScannedParityTest(parameterized.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+def test_qb_scan_preserves_layer_histograms():
+  from maxtext.layers import quantile_balancing as qb
+
+  cfg = _toy_config(scan_layers=True, moe_quantile_balancing=True, moe_qb_num_bins=32)
+  model = _build_model(cfg)
+  nnx.pop(model, qb.QBHistogram)
+  template = qb.empty_histograms(model, cfg)
+  tokens, positions = _inputs(1)
+  _forward(model, tokens, positions)
+  observations = qb.extract(nnx.pop(model, qb.QBHistogram))
+  assert set(observations) == set(template)
+  for path, counts in observations.items():
+    assert counts.shape == template[path].shape
+    np.testing.assert_array_equal(
+        np.asarray(counts).sum(axis=(-3, -1)), np.full(counts.shape[:-3] + (cfg.num_experts,), _SEQ_LEN)
+    )
+  qb.apply_updates(model, observations, cfg.num_experts_per_tok)
+  biases = {
+      path: np.asarray(module.gate.bias.value).copy()
+      for path, module in nnx.iter_graph(model)
+      if type(module).__name__ == "RoutedMoE"
+  }
+  model(tokens, positions, model_mode=MODEL_MODE_TRAIN, enable_dropout=False, collect_qb=False)
+  assert not qb.extract(nnx.pop(model, qb.QBHistogram))
+  for path, module in nnx.iter_graph(model):
+    if path in biases:
+      np.testing.assert_array_equal(module.gate.bias.value, biases[path])

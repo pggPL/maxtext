@@ -2194,6 +2194,7 @@ class NNXDecoder(nnx.Module):
       multimodal_input: None | MultimodalInput = None,
       forced_routed_experts: jnp.ndarray | None = None,
       decoder_input_embeddings=None,
+      collect_qb=True,
   ):
     cfg = self.config
     assert decoder_input_tokens.ndim == 2  # [batch, len]
@@ -2568,6 +2569,7 @@ class NNXDecoder(nnx.Module):
             attention_metadata=attention_metadata,
             previous_chunk=previous_chunk,
             slot=slot,
+            collect_qb=collect_qb,
         )
       else:
         prevent_cse = maxtext_utils.should_prevent_cse_in_remat(cfg)
@@ -3352,6 +3354,7 @@ class NNXDecoder(nnx.Module):
       attention_metadata=None,
       previous_chunk=None,
       slot=None,
+      collect_qb=True,
   ):
     """Apply Kimi-K3 decoder layers with Attention Residuals highway."""
     cfg = self.config
@@ -3366,6 +3369,7 @@ class NNXDecoder(nnx.Module):
           attention_metadata=attention_metadata,
           previous_chunk=previous_chunk,
           slot=slot,
+          collect_qb=collect_qb,
       )
     block_residual = None
 
@@ -3381,6 +3385,7 @@ class NNXDecoder(nnx.Module):
           model_mode=model_mode,
           previous_chunk=previous_chunk,
           slot=slot,
+          collect_qb=collect_qb,
           kv_cache=kv_cache,
           attention_metadata=attention_metadata,
       )
@@ -3420,6 +3425,7 @@ class NNXDecoder(nnx.Module):
       attention_metadata=None,
       previous_chunk=None,
       slot=None,
+      collect_qb=True,
   ):
     """Scanned Kimi-K3: unrolled prefix, lax.scan over whole cycles, unrolled suffix.
 
@@ -3449,6 +3455,7 @@ class NNXDecoder(nnx.Module):
         "model_mode": model_mode,
         "previous_chunk": previous_chunk,
         "slot": slot,
+        "collect_qb": collect_qb,
         "attention_metadata": attention_metadata,
     }
 
@@ -3466,6 +3473,7 @@ class NNXDecoder(nnx.Module):
           model_mode,
           length=num_blocks,
           metadata_axis_name="scanned_blocks",
+          collect_qb=collect_qb,
           skip_block_remat=True,
           previous_chunk=previous_chunk,
           slot=slot,
