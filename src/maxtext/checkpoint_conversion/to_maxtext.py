@@ -66,6 +66,8 @@ import jax
 from maxtext.configs import pyconfig
 from maxtext.configs.types import DType
 from maxtext.checkpoint_conversion.utils.hf_model_configs import HF_MODEL_CONFIGS
+from maxtext.checkpoint_conversion.utils import mxfp4
+from maxtext.checkpoint_conversion.utils.lazy_tensor import LazyTensor
 from maxtext.checkpoint_conversion.utils.param_mapping import HOOK_FNS, PARAM_MAPPING
 from maxtext.checkpoint_conversion.utils.tensor_handling import (
     apply_hook_fns,
@@ -79,7 +81,6 @@ from maxtext.inference.inference_utils import str2bool
 from maxtext.utils import max_logging, max_utils, maxtext_utils, model_creation_utils
 from maxtext.utils.globals import HF_IDS
 import numpy as np
-from orbax.checkpoint import type_handlers
 from safetensors import safe_open
 
 try:
@@ -99,6 +100,76 @@ def resolve_scale_key(key: str, container) -> str:
     if alt_key in container:
       return alt_key
   return key
+
+
+def _maybe_load_mxfp4_weight(key: str, has_key, fetch_raw, save_dtype: str):
+  """Materializes `X.weight` from a `compressed-tensors` MXFP4 pair if present.
+
+  Checkpoints in `mxfp4-pack-quantized` format (e.g. Kimi-K3 routed experts) ship
+  `X.weight_packed` + `X.weight_scale` instead of `X.weight`. MaxText keeps expert
+  weights in a dense float dtype, so we dequantize on the fly and return the result
+  through the regular dtype-conversion path. Returns None when `key` is not backed by
+  such a pair, so callers fall through to their normal lookup.
+  """
+  pair = mxfp4.resolve_mxfp4_pair(key, has_key)
+  if pair is None:
+    return None
+  packed_key, scale_key = pair
+  packed = _to_uint8_numpy(fetch_raw(packed_key))
+  scale = _to_uint8_numpy(fetch_raw(scale_key))
+  # Dequantized experts are dense; store them in the checkpoint's float dtype.
+  # (FP8 save mode keeps *pre-quantized* FP8 sources as FP8; a dequantized MXFP4
+  # weight has no FP8 source, so it is stored as bf16 like any other bf16 tensor.)
+  target = np.float32 if save_dtype in ("float32", DType.FLOAT32) else ml_dtypes.bfloat16
+  return mxfp4.dequantize_mxfp4_packed(packed, scale, dtype=target)
+
+
+def _to_uint8_numpy(t) -> np.ndarray:
+  if torch is not None and isinstance(t, torch.Tensor):
+    return t.detach().cpu().contiguous().view(torch.uint8).numpy()
+  return np.asarray(t).view(np.uint8)
+
+
+def _is_uint8(t) -> bool:
+  if torch is not None and isinstance(t, torch.Tensor):
+    return t.dtype == torch.uint8
+  return getattr(t, "dtype", None) == np.uint8
+
+
+def _convert_hf_tensor(key: str, tensor, save_dtype: str) -> np.ndarray:
+  """`_convert_tensor_to_numpy`, except raw MXFP4 sidecars stay byte-exact uint8.
+
+  When routed experts are kept packed (`routed_experts_weight_format=mxfp4`) the mapping
+  requests `X.weight_packed` / `X.weight_scale` directly; casting those codes to a float
+  dtype would destroy them. Float-valued `weight_scale` tensors of other formats (e.g.
+  compressed-tensors FP8) are not uint8 and keep the normal conversion.
+  """
+  if mxfp4.is_mxfp4_sidecar_key(key) and _is_uint8(tensor):
+    return _to_uint8_numpy(tensor)
+  return _convert_tensor_to_numpy(tensor, save_dtype)
+
+
+def _is_mxfp4_passthrough(hf_source_keys_or_key, config) -> bool:
+  """True when a MaxText param is assembled from raw MXFP4 sidecars (saved as uint8).
+
+  Gated on the config because `.weight_scale` is also the name of float FP8 scales
+  (see `resolve_scale_key`). A param must not mix sidecar and regular keys, since the
+  whole stacked param is saved with one dtype.
+  """
+  if getattr(config, "routed_experts_weight_format", "bf16") != "mxfp4":
+    return False
+  leaves = []
+  pending = [hf_source_keys_or_key]
+  while pending:
+    item = pending.pop()
+    if isinstance(item, (list, tuple)):
+      pending.extend(item)
+    elif isinstance(item, str):
+      leaves.append(item)
+  is_sidecar = {mxfp4.is_mxfp4_sidecar_key(k) for k in leaves}
+  if len(is_sidecar) > 1:
+    raise ValueError(f"param mixes MXFP4 sidecar and regular HF keys: {hf_source_keys_or_key}")
+  return is_sidecar == {True}
 
 
 def _convert_tensor_to_numpy(tensor, save_dtype: str = "bfloat16") -> np.ndarray:
@@ -227,6 +298,8 @@ class LazyHFLoader:
     self._local_shard_paths = {}
     # Use a lock to serialize heavy RAM operations, but NOT downloads
     self._ram_lock = threading.Lock()
+    # Keys of a single-file checkpoint, read lazily on the first lookup that needs them.
+    self._single_file_keys = None
     self._initialize_index()
 
   def __getstate__(self):
@@ -287,28 +360,24 @@ class LazyHFLoader:
     resolved_key = resolve_scale_key(key, self.shard_map)
     shard_name = self.shard_map.get(resolved_key)
 
-    if shard_name is None and None in self.shard_map:
+    if shard_name is None and None in self.shard_map and self._has_key(resolved_key):
       shard_name = self.shard_map[None]
-    elif shard_name is None:
+    if shard_name is None:
+      # `compressed-tensors` MXFP4 checkpoints store `X.weight_packed` + `X.weight_scale`
+      # in place of `X.weight`; dequantize the pair on the fly.
+      dense = _maybe_load_mxfp4_weight(
+          key,
+          has_key=self._has_key,
+          fetch_raw=self._read_raw_tensor,
+          save_dtype=self.save_dtype,
+      )
+      if dense is not None:
+        return dense
       # Fallback: sometimes keys in index don't perfectly match requested keys if there are prefix mismatches.
       # You might need advanced fuzzy matching here if you encounter errors.
       raise ValueError(f"Key {key} not found in HF checkpoint index.")
 
-    if shard_name in self._local_shard_paths:
-      local_path = self._local_shard_paths[shard_name]
-    else:
-      if self.is_local:
-        local_path = os.path.join(self.model_id, shard_name)
-      else:
-        # STEP 1: Download outside the lock.
-        # multiple threads can download different shards at the same time.
-        local_path = hf_hub_download(
-            repo_id=self.model_id,
-            filename=shard_name,
-            token=self.token,
-            revision=self.revision,
-        )
-      self._local_shard_paths[shard_name] = local_path
+    local_path = self._local_shard_path(shard_name)
 
     # STEP 2: Lock ONLY the reading into RAM.
     # This prevents multiple threads from simultaneously allocating large chunks of RAM.
@@ -316,104 +385,42 @@ class LazyHFLoader:
       framework = "pt" if torch is not None else "np"
       with safe_open(local_path, framework=framework, device="cpu") as f:
         t = f.get_tensor(resolved_key)
-        return _convert_tensor_to_numpy(t, dtype or self.save_dtype)
+        return _convert_hf_tensor(resolved_key, t, dtype or self.save_dtype)
 
+  def _local_shard_path(self, shard_name: str) -> str:
+    """Returns the local path of a shard, downloading it first for remote repos."""
+    if shard_name in self._local_shard_paths:
+      return self._local_shard_paths[shard_name]
+    if self.is_local:
+      local_path = os.path.join(self.model_id, shard_name)
+    else:
+      # STEP 1: Download outside the lock.
+      # multiple threads can download different shards at the same time.
+      local_path = hf_hub_download(
+          repo_id=self.model_id,
+          filename=shard_name,
+          token=self.token,
+          revision=self.revision,
+      )
+    self._local_shard_paths[shard_name] = local_path
+    return local_path
 
-class LazyTensor:
-  """
-  A proxy object that looks like a NumPy array but delays actual loading
-  and transformation until __array__ is called (e.g., by Orbax during save).
-  """
+  def _has_key(self, key: str) -> bool:
+    """True if the checkpoint holds `key`; single-file checkpoints are enumerated on first use."""
+    if None not in self.shard_map:
+      return key in self.shard_map
+    if self._single_file_keys is None:
+      with safe_open(self._local_shard_path(self.shard_map[None]), framework="np", device="cpu") as f:
+        self._single_file_keys = frozenset(f.keys())
+    return key in self._single_file_keys
 
-  def __init__(
-      self,
-      load_fn: Callable[[], np.ndarray],
-      shape: tuple,
-      dtype,
-      name: str = "unknown",
-  ):
-    self._load_fn = load_fn
-    self.shape = shape
-    try:
-      self.dtype = np.dtype(dtype)
-    except (TypeError, ValueError):
-      dtype_str = str(dtype)
-      if "float8_e4m3fn" in dtype_str:
-        self.dtype = np.dtype(ml_dtypes.float8_e4m3fn)
-      elif "bfloat16" in dtype_str:
-        self.dtype = np.dtype(ml_dtypes.bfloat16)
-      else:
-        self.dtype = np.dtype(np.float32)
-    self.ndim = len(shape)
-    self.name = name
-
-  @property
-  def size(self):
-    """Total number of elements in the tensor."""
-    return np.prod(self.shape)
-
-  @property
-  def nbytes(self):
-    """Return estimated nbytes so Orbax doesn't need to load the real array to find out."""
-    return self.size * self.dtype.itemsize
-
-  @property
-  def itemsize(self):
-    return self.dtype.itemsize
-
-  def __array__(self, dtype=None):
-    """
-    Materializes the tensor data.
-
-    When this method is invoked, it finally calls the `_load_fn` that was
-    provided during initialization. This function executes the actual loading
-    and transformation of the tensor from the Hugging Face checkpoint. The
-    resulting NumPy array is then returned to the caller.
-    """
-    # This method is called just-in-time by Orbax when saving this specific leaf.
-    try:
-      arr = self._load_fn()
-    except Exception as e:
-      max_logging.log(f"FATAL ERROR: Failed to load tensor '{self.name}' (shape {self.shape}). Error: {e}")
-      # Re-raise the original exception so it doesn't get masked by "object __array__..."
-      raise
-
-    if not isinstance(self.shape, list) and arr.shape != self.shape:
-      raise ValueError(f"Shape mismatch for tensor '{self.name}'. Expected {self.shape}, but got {arr.shape}.")
-
-    # Ensure it's a standard numpy array (converts JAX arrays if necessary)
-    if not isinstance(arr, np.ndarray):
-      arr = np.array(arr)
-
-    if dtype is not None and arr.dtype != dtype:
-      return arr.astype(dtype)
-    return arr
-
-  def __repr__(self):
-    return f"LazyTensor(name={self.name}, shape={self.shape}, dtype={self.dtype})"
-
-
-class LazyTensorHandler(type_handlers.NumpyHandler):
-  """
-  Custom Orbax handler for LazyTensor.
-
-  It masquerades as a standard NumpyHandler so that the resulting checkpoint
-  has the standard 'array_metadatas' structure and can be loaded by
-  standard MaxText instances.
-  """
-
-  async def serialize(self, value, *args, **kwargs):
-    # MATERIALIZE: Trigger the lazy load (__array__) explicitly before saving.
-    # This ensures the parent NumpyHandler receives a real np.ndarray.
-    if hasattr(value, "__array__"):
-      value = np.array(value)
-
-    return await super().serialize(value, *args, **kwargs)
-
-
-# Register LazyTensor with the custom handler.
-# It's safe to register this globally even if eager loading is used.
-type_handlers.register_type_handler(LazyTensor, LazyTensorHandler(), override=True)
+  def _read_raw_tensor(self, key: str):
+    """Reads a tensor exactly as stored (no dtype conversion), for MXFP4 sidecars."""
+    local_path = self._local_shard_path(self.shard_map.get(key, self.shard_map.get(None)))
+    with self._ram_lock:
+      framework = "pt" if torch is not None else "np"
+      with safe_open(local_path, framework=framework, device="cpu") as f:
+        return f.get_tensor(key)
 
 
 def get_maxtext_model_info(config):
@@ -1152,10 +1159,18 @@ def main(
           return None
         resolved_key = resolve_scale_key(key, hf_state_dict_numpy)
         if resolved_key not in hf_state_dict_numpy:
+          dense = _maybe_load_mxfp4_weight(
+              key,
+              has_key=lambda k: k in hf_state_dict_numpy,
+              fetch_raw=hf_state_dict_numpy.__getitem__,
+              save_dtype=save_dtype,
+          )
+          if dense is not None:
+            return dense
           raise ValueError(f"HuggingFace key {key} not found in state_dict.")
 
         v = hf_state_dict_numpy[resolved_key]
-        return _convert_tensor_to_numpy(v, dtype or save_dtype)
+        return _convert_hf_tensor(resolved_key, v, dtype or save_dtype)
 
       tensor_getter = _eager_getter
 
@@ -1230,7 +1245,7 @@ def main(
           mt_target_shape_or_shapes,
           mt_param_key_or_keys,
           final_mt_weights,
-          param_save_dtype,
+          np.uint8 if _is_mxfp4_passthrough(hf_source_keys_or_key, config) else param_save_dtype,
           lazy_load_tensors,
       )
 
@@ -1259,7 +1274,9 @@ def main(
 
   # Save the converted weights to a MaxText checkpoint.
   # If simulated_cpu_devices_count > 1, weights are promoted from NumPy to JAX arrays
-  # and sharded across virtual devices.
+  # and sharded across virtual devices, which materializes every lazy leaf. Only with
+  # simulated_cpu_devices_count=1 and lazy loading are weights loaded just in time
+  # during the save, bounded by `checkpoint_storage_concurrent_gb`.
   save_weights_to_checkpoint(
       output_directory,
       state_params,
@@ -1267,6 +1284,7 @@ def main(
       config.checkpoint_storage_use_ocdbt,
       config.checkpoint_storage_use_zarr3,
       config=config,
+      checkpoint_storage_concurrent_gb=config.checkpoint_storage_concurrent_gb,
   )
 
   print_ram_usage("Program Ends")
