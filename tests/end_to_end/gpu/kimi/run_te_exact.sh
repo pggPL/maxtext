@@ -52,7 +52,7 @@ use_iota_embed=false enable_checkpointing=false dataset_type=synthetic
 jax_cache_dir=$OUTPUT/jax_cache ${EXTRA_MAXTEXT_ARGS:-}"
 EXTRA="${EXTRA//$'\n'/ }"
 CMD=(test-maxtext.sh --multiprocess -n 1 -b "${BATCH_PER_GPU:-1}"
-  --model-name=kimi-k3 --attn-type=dot_product --remat-policy=full
+  --model-name=kimi-k3 --attn-type=dot_product --remat-policy="${REMAT_POLICY:-full}"
   --steps="${STEPS:-20}" --data-parallel=1 --fsdp=1 --tensor-parallel=1
   --tensor-sequence-parallel=1 --mem-fraction 0.85 --output "$OUTPUT" -a "$EXTRA")
 printf 'Kimi-K3 + TE: full-width router, two-branch SiTU, global-step QB. EP=%s FSDP=%s\n' "$EP" "$FSDP"
