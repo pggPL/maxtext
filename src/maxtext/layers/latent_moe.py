@@ -309,7 +309,7 @@ class KimiLatentMoEBlock(nnx.Module):
         x_latent, gate_inputs=hidden_states, collect_qb=collect_qb, qb_token_mask=qb_token_mask
     )
     if self.routed_experts.config.te_moe_block:
-      total_recv_tokens, capacity = routing_stats
+      total_recv_tokens, capacity, _ = routing_stats
       self.sow(nnx.Intermediate, "te_moe_total_recv_tokens", total_recv_tokens)
       self.sow(nnx.Intermediate, "te_moe_recv_capacity_per_rank", capacity)
       self.sow(nnx.Intermediate, "te_moe_capacity_overflow", jnp.any(total_recv_tokens > capacity))
