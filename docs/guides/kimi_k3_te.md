@@ -19,17 +19,22 @@ The Google integration base contains these pinned PR heads:
 
 ## TE dependency
 
-Use the stack [TE #73](https://github.com/pggPL/TransformerEngine/pull/73)
-→ [#74](https://github.com/pggPL/TransformerEngine/pull/74)
-→ [#75](https://github.com/pggPL/TransformerEngine/pull/75), including token-mask
-support. The pinned TE revision is
+The only TE change this path needs beyond upstream `main` is the two-branch SiTU
+activation from [TE #74](https://github.com/pggPL/TransformerEngine/pull/74).
+Routing on the full hidden state and QB statistics run in MaxText's native
+router and reach TE through its upstream `RoutingMapInfo`, so no separate
+router-input or QB TE change is required.
+
+The pinned TE revision is
 `ee66c66ec2e2205f59b4a0d7f1f1dbd89dce0130`; it is also recorded in
 `tests/end_to_end/gpu/kimi/te_revision.txt`. Build TE JAX from that revision in
 an appropriate GPU container before running this code. An older TE installation
 fails explicitly when a required capability is missing.
 
-The router reads the full FP32 hidden state, while experts process the latent.
-TE applies SiTU with caps 4/25 on both FFN branches and applies routing weights
+The native router reads the full FP32 hidden state and produces the top-k
+expert indices and weights; TE dispatches the latent on that routing map and
+returns the routing-weight gradients, so the router stays differentiable. TE
+applies SiTU with caps 4/25 on both FFN branches and applies routing weights
 late. MaxText retains separate `wi_0`/`wi_1` checkpoint parameters and concatenates
 them only for the TE call. KDA, gated NoPE MLA, Attention Residuals, latent
 projections, post-expert RMSNorm and shared experts follow the Google model.
@@ -45,17 +50,14 @@ Empty batches/layers and rejected skip-step optimizer updates preserve the old
 bias. Evaluation does not collect statistics or update biases. Checkpoints
 persist the bias, while histogram intermediates are discarded.
 
-The native router uses a JAX/LAX histogram with bounded token chunks. This is a
-portable baseline, including TPU; its distributed performance is unmeasured.
-The TE path returns per-token-shard histograms. MaxText accumulates them in the
+The router uses a JAX/LAX histogram with bounded token chunks on both the
+native and the TE path. This is a portable baseline, including TPU; its
+distributed performance is unmeasured. MaxText accumulates histograms in the
 microbatch scan carry and reduces them once after the full step, rather than
 stacking a histogram for every microbatch or averaging local quantiles.
 
-`moe_qb_num_bins=1000` controls the histogram resolution. TE also accepts
-`moe_qb_histogram_mode=fused_atomic` or `two_kernel`.
-`moe_qb_mask_padding=true` excludes tokens with input segment ID zero. When a
-mask is supplied, TE computes routing/cutoff and JAX collects the masked histogram
-from the saved scores; the no-mask path uses the CUDA histogram kernels directly.
+`moe_qb_num_bins=1000` controls the histogram resolution.
+`moe_qb_mask_padding=true` excludes tokens with input segment ID zero.
 Disabling masking is restricted to synthetic data. QB requires sigmoid FP32
 routing, no routing groups, zero `load_balance_loss_weight`, and zero
 `routed_bias_update_rate`. Tunix gradient accumulation is not integrated.

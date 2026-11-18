@@ -79,19 +79,9 @@ def empty_histograms(model, config):
     if type(module).__name__ != "RoutedMoE":
       continue
     bias = module.gate.bias.value
-    mesh = module.mesh
-    token_axes = ()
-    if config.te_moe_block:
-      token_axes = tuple(dict.fromkeys(("data", "fsdp", module._expert_parallelism_name)))
-      token_axes = tuple(axis for axis in token_axes if axis in mesh.shape)
-    num_shards = 1
-    for axis in token_axes:
-      num_shards *= mesh.shape[axis]
-    leading = bias.shape[:-1]
-    counts = jnp.zeros((*leading, num_shards, bias.shape[-1], config.moe_qb_num_bins), jnp.int32)
-    if mesh is not None:
-      spec = P(*([None] * len(leading)), token_axes or None, None, None) if token_axes else P()
-      counts = jax.lax.with_sharding_constraint(counts, NamedSharding(mesh, spec))
+    counts = jnp.zeros((*bias.shape[:-1], 1, bias.shape[-1], config.moe_qb_num_bins), jnp.int32)
+    if module.mesh is not None:
+      counts = jax.lax.with_sharding_constraint(counts, NamedSharding(module.mesh, P()))
     result[(*path, "qb_histogram")] = counts
   return result
 

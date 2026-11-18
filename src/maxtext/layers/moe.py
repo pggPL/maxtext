@@ -5118,11 +5118,13 @@ class RoutedMoE(nnx.Module):
       w1_bias: jax.Array | None,
       wo_bias: jax.Array | None,
       out_sharding: NamedSharding | None = None,
-      router_input: jax.Array | None = None,
-      collect_qb: bool = False,
-      qb_token_mask: jax.Array | None = None,
+      routing: tuple[jax.Array, jax.Array] | None = None,
   ) -> tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]:
-    """Run TransformerEngine's fused EP MoEBlock using MaxText-owned params."""
+    """Run TransformerEngine's fused EP MoEBlock using MaxText-owned params.
+
+    `routing` is an optional `(top_k_weights, top_k_indices)` pair from the native router; when given, TE
+    skips its own gate and dispatches on the caller's routing map (`te_moe.RoutingMapInfo`).
+    """
     try:
       from transformer_engine.jax import moe as te_moe  # pylint: disable=import-outside-toplevel
       from transformer_engine.jax.sharding import MeshResource  # pylint: disable=import-outside-toplevel
@@ -5166,42 +5168,31 @@ class RoutedMoE(nnx.Module):
     checkpoint_kwargs = _get_te_moe_checkpoint_kwargs(te_moe.moe)
     cudnn_gmm_fusion_kwargs = _get_te_moe_cudnn_gmm_fusion_kwargs(self.config.te_moe_disable_cudnn_gmm_fusion)
 
-    router_kwargs = dict(
-        gate_kernel=gate_kernel,
-        num_experts_per_tok=self.num_experts_per_tok,
-        expert_bias=expert_bias,
-        score_function=self.config.routed_score_func or "softmax",
-        use_pre_softmax=False,
-        num_groups=None if self.config.n_routing_groups <= 0 else self.config.n_routing_groups,
-        group_topk=None if self.config.topk_routing_group <= 0 else self.config.topk_routing_group,
-        scaling_factor=self.config.routed_scaling_factor,
-        aux_loss_coeff=self.config.load_balance_loss_weight,
-        gate_kernel_axes=self.kernel_axes,
-    )
-    if collect_qb:
-      if not hasattr(te_moe, "RouterComputationInfo"):
-        raise ValueError("Kimi QB requires TE PR #75 including token-mask support.")
-      parameters = inspect.signature(te_moe.RouterComputationInfo).parameters
-      if "qb_bin_bounds" not in parameters or "qb_token_mask" not in parameters:
-        raise ValueError("Kimi QB requires TE PR #75 including token-mask support.")
-      router_kwargs.update(
-          qb_bin_bounds=qb.bin_bounds(expert_bias),
-          qb_token_mask=qb_token_mask,
-          qb_num_bins=self.config.moe_qb_num_bins,
-          qb_histogram_mode=self.config.moe_qb_histogram_mode,
-      )
     te_parameters = inspect.signature(te_moe.moe).parameters
-    if router_input is not None:
-      if (
-          not hasattr(te_moe, "RouterComputationInfo")
-          or "router_input" not in inspect.signature(te_moe.RouterComputationInfo).parameters
-      ):
-        raise ValueError("Installed TE MoEBlock lacks separate router_input support; upgrade TE.")
-      router_kwargs.update(
-          router_input=router_input, router_input_axes=("activation_batch", "activation_norm_length", None)
+    if routing is not None:
+      if not hasattr(te_moe, "RoutingMapInfo") or "router_info" not in te_parameters:
+        raise ValueError("Installed TE MoEBlock lacks caller-supplied routing (RoutingMapInfo); upgrade TE.")
+      top_k_weights, top_k_indices = routing
+      router_kwargs = dict(
+          router_info=te_moe.RoutingMapInfo(
+              routing_indices=top_k_indices.astype(jnp.int32), routing_weights=top_k_weights
+          )
       )
-    if "router_info" in te_parameters:
-      router_kwargs = dict(router_info=te_moe.RouterComputationInfo(**router_kwargs))
+    else:
+      router_kwargs = dict(
+          gate_kernel=gate_kernel,
+          num_experts_per_tok=self.num_experts_per_tok,
+          expert_bias=expert_bias,
+          score_function=self.config.routed_score_func or "softmax",
+          use_pre_softmax=False,
+          num_groups=None if self.config.n_routing_groups <= 0 else self.config.n_routing_groups,
+          group_topk=None if self.config.topk_routing_group <= 0 else self.config.topk_routing_group,
+          scaling_factor=self.config.routed_scaling_factor,
+          aux_loss_coeff=self.config.load_balance_loss_weight,
+          gate_kernel_axes=self.kernel_axes,
+      )
+      if "router_info" in te_parameters:
+        router_kwargs = dict(router_info=te_moe.RouterComputationInfo(**router_kwargs))
     parallel_kwargs = {}
     if "collect_expert_counts" in te_parameters:
       parallel_kwargs["collect_expert_counts"] = False
@@ -5243,10 +5234,6 @@ class RoutedMoE(nnx.Module):
         **checkpoint_kwargs,
     )
     output, lb_loss, total_recv_tokens = result[:3]
-    if collect_qb:
-      if len(result) != 5:
-        raise ValueError("TE QB must return per-shard histograms as its fifth result.")
-      qb.record(self, result[4])
     recv_capacity_per_rank = max_utils.get_te_moe_recv_capacity_per_rank()
     output = output.astype(self.dtype)
     if lb_loss is not None:
@@ -5302,7 +5289,25 @@ class RoutedMoE(nnx.Module):
     routing_inputs = inputs if gate_inputs is None else gate_inputs.astype(gate_dtype)
 
     if cfg.te_moe_block:
-      gate_kernel = jnp.asarray(self.gate.kernel[...], gate_dtype if gate_inputs is not None else self.dtype)
+      # TE's fused router reads the expert input. A separate router input or QB statistics use the native
+      # router and hand TE the routing map; TE then computes no load-balance loss.
+      routing = None
+      if gate_inputs is not None or collect_qb:
+        if cfg.load_balance_loss_weight != 0:
+          raise ValueError("te_moe_block=True with a separate router input or QB requires load_balance_loss_weight=0.")
+        gate_logits, pre_bias_logits = self.gate(routing_inputs)
+        if collect_qb:
+          forced_routed_experts, counts = qb.route_and_observe(
+              gate_logits,
+              pre_bias_logits,
+              self.gate.bias.value,
+              qb_token_mask,
+              self.num_experts_per_tok,
+              cfg.moe_qb_num_bins,
+          )
+          qb.record(self, counts)
+        routing = self.get_topk(gate_logits, pre_bias_logits, forced_routed_experts=forced_routed_experts)
+      gate_kernel = jnp.asarray(self.gate.kernel[...], self.dtype)
       if cfg.prefuse_moe_weights:
         wi_kernel = jnp.asarray(self.wi[...], self.dtype)
       else:
@@ -5327,9 +5332,7 @@ class RoutedMoE(nnx.Module):
           w1_bias,
           wo_bias,
           out_sharding,
-          router_input=routing_inputs if gate_inputs is not None else None,
-          collect_qb=collect_qb,
-          qb_token_mask=qb_token_mask,
+          routing=routing,
       )
 
     gate_logits, pre_bias_logits = self.gate(routing_inputs)

@@ -1721,9 +1721,6 @@ class DeepSeekMoE(BaseModel):
       False, description="Collect global-step QB histograms and update Kimi-K3 router biases."
   )
   moe_qb_num_bins: PositiveInt = Field(1000, description="Uniform histogram bins per expert for Quantile Balancing.")
-  moe_qb_histogram_mode: Literal["fused_atomic", "two_kernel"] = Field(
-      "fused_atomic", description="TE QB histogram mode."
-  )
   moe_qb_mask_padding: bool = Field(
       True, description="Exclude sequence padding from QB; disabling requires synthetic data."
   )
