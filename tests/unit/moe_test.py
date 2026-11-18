@@ -5516,14 +5516,19 @@ class RoutedMoeRouterInputAndUpActivationTest(parameterized.TestCase):
         return self._overrides[name] if name in self._overrides else getattr(self._base, name)
 
     situ_cfg = self._cfg(mlp_activations=["situ_gate", "situ_linear"])
+    te_situ, _ = self._block(_WithOverrides(situ_cfg, te_moe_block=True))
+    self.assertTrue(te_situ.is_situ_glu)
     for overrides, msg in (
-        ({"te_moe_block": True}, "fused MoE kernels"),
         ({"attention": "vllm_rpa"}, "fused MoE kernels"),
         ({"decoder_block": DecoderBlockType.GPT_OSS}, "clipped-SwiGLU"),
         ({"mlp_activations_limit": 7.0}, "clipped-SwiGLU"),
     ):
       with self.subTest(**{k: str(v) for k, v in overrides.items()}), self.assertRaisesRegex(ValueError, msg):
         self._block(_WithOverrides(situ_cfg, **overrides))
+
+    other_up_cfg = self._cfg(mlp_activations=["silu", "situ_linear"])
+    with self.assertRaisesRegex(ValueError, "fused MoE kernels"):
+      self._block(_WithOverrides(other_up_cfg, te_moe_block=True))
 
   @parameterized.named_parameters(("sparse_ragged_dot", True), ("dense", False))
   def test_router_reads_gate_inputs_of_a_different_width(self, sparse_matmul):

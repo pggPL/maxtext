@@ -66,6 +66,7 @@ from maxtext.utils import elastic_utils
 from maxtext.layers.multi_token_prediction import calculate_mtp_acceptance_rate, calculate_mtp_loss, mtp_acceptance, mtp_losses
 from maxtext.layers.attention_mla import indexer_losses
 from maxtext.layers import moe
+from maxtext.layers import quantile_balancing as qb
 from maxtext.common import checkpointing, profiler
 from maxtext.common import snapshotting
 from maxtext.common.goodput import (
@@ -207,6 +208,7 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
         "encoder_images": encoder_images,
         "encoder_image_masks": encoder_image_masks,
     }
+  qb_kwargs = {"collect_qb": is_train} if qb.enabled(config) else {}
   # Flax NNX model: forward pass, then pop Intermediates sown during it.
   logits = model(
       decoder_input_tokens=data["inputs"],
@@ -217,6 +219,7 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
       decoder_target_tokens=data["targets"],
       decoder_target_mask=data["targets_segmentation"],
       **forced_routing_kwargs,
+      **qb_kwargs,
   )
   # mtp_losses and mtp_acceptance subclass nnx.Intermediate, and nnx type filters match
   # subclasses. Pop them before the generic Intermediate pop below, which would otherwise
@@ -231,6 +234,7 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
     # Pop dedicated indexer_losses to harvest auxiliary KL loss and prevent model state PyTree mismatches.
     indexer_losses_state = nnx.pop(model, indexer_losses)
 
+  qb_histograms = qb.extract(nnx.pop(model, qb.QBHistogram)) if qb.enabled(config) else {}
   intermediates = nnx.pop(model, nnx.Intermediate)
   intermediate_outputs = intermediates.to_pure_dict()
   # defer_small_all_reduces: the MoE layers emitted local partial expert counts; reduce the stacked arrays here, once,
@@ -390,6 +394,7 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
 
   aux = {
       "intermediate_outputs": intermediate_outputs,
+      "qb_histograms": qb_histograms,
       "xent_sum": xent_sum,
       "z_loss": total_z_loss,
       "total_weights": total_weights,
@@ -690,6 +695,16 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   else:
     state.apply_gradients(grads)
   new_state = state
+
+  if qb.enabled(config):
+    accepted = total_weights > 0
+    if config.skip_step_on_spikes:
+      optimizer_state = nnx.to_pure_dict(nnx.state(new_state.optimizer)).get("opt_state", {})
+      skipped = optimizer_state.get("is_skipped") if isinstance(optimizer_state, dict) else None
+      if skipped is None:
+        raise ValueError("QB needs the skip-step optimizer's is_skipped signal.")
+      accepted = accepted & ~skipped
+    qb.apply_updates(new_state.model, aux["qb_histograms"], config.num_experts_per_tok, accepted)
 
   # Apply updates for Auxiliary-Loss-Free load balancing for DeepSeek family
   # pylint: disable=too-many-nested-blocks

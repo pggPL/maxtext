@@ -66,6 +66,9 @@ num_shared_experts: 2
 routed_scaling_factor: 1.0
 routed_score_func: "sigmoid"
 routed_bias: true
+moe_quantile_balancing: true
+load_balance_loss_weight: 0.0
+routed_bias_update_rate: 0.0
 # Routed experts run through moe.RoutedMoE on the 3584-wide latent, while the router reads the full
 # 7168-wide hidden state (passed as `gate_inputs`); router math is fp32 as in the reference.
 moe_expert_input_dim: 3584

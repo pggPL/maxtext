@@ -34,6 +34,7 @@ from jax.sharding import Mesh
 from maxtext.common.common_types import (
     AttentionType,
     Config,
+    MODEL_MODE_TRAIN,
     MODEL_MODE_AUTOREGRESSIVE,
     MODEL_MODE_PREFILL,
 )
@@ -257,6 +258,7 @@ class KimiK3DecoderLayer(nnx.Module):
       attention_metadata=None,
       *,
       layer_idx=None,
+      collect_qb=True,
   ):
     """Runs one layer.
 
@@ -357,7 +359,19 @@ class KimiK3DecoderLayer(nnx.Module):
 
     # STEP 6
     normed_mlp_in = self.post_self_attention_layer_norm(pooled)
-    mlp_out = self.mlp(normed_mlp_in)
+    if self.is_moe:
+      collect_qb = (
+          collect_qb
+          and getattr(self.config, "moe_quantile_balancing", False)
+          and model_mode == MODEL_MODE_TRAIN
+          and self.config.model_call_mode != "inference"
+      )
+      token_mask = None
+      if collect_qb and self.config.moe_qb_mask_padding and decoder_segment_ids is not None:
+        token_mask = decoder_segment_ids > 0
+      mlp_out = self.mlp(normed_mlp_in, collect_qb=collect_qb, qb_token_mask=token_mask)
+    else:
+      mlp_out = self.mlp(normed_mlp_in)
     mlp_out = self.with_logical_constraint(mlp_out)
 
     # STEP 7
@@ -445,6 +459,7 @@ class KimiK3ScannableBlock(nnx.Module):
       previous_chunk=None,
       slot=None,
       attention_metadata=None,
+      collect_qb=True,
   ):
     y, attn_res_state, layer_idx = carry
     n = self.num_of_layers
@@ -455,6 +470,7 @@ class KimiK3ScannableBlock(nnx.Module):
         "decoder_positions": decoder_positions,
         "deterministic": deterministic,
         "model_mode": model_mode,
+        "collect_qb": collect_qb,
         "previous_chunk": previous_chunk,
         "slot": slot,
         "attention_metadata": attention_metadata,
