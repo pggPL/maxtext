@@ -99,4 +99,5 @@ guides/model_bringup.md
 guides/lora_model_bringup.md
 guides/distillation.md
 guides/eval_framework.md
+guides/kimi_k3_te.md
 ```

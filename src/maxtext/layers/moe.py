@@ -21,6 +21,7 @@ import functools
 import inspect
 import math
 import random
+from types import SimpleNamespace
 from typing import Any, Iterable, Optional, Tuple, Union
 
 from aqt.jax.v2 import aqt_tensor as aqt
@@ -45,6 +46,7 @@ from maxtext.kernels.ragged.ragged_sort_tc import ring_ragged_sort_tc
 from maxtext.kernels.ragged.ragged_sort_tc import ring_ragged_unsort_tc
 from maxtext.kernels.ragged.ragged_sort_tc import tc_buffer_row_weights
 from maxtext.layers import attentions, linears, nnx_wrappers, quantizations
+from maxtext.layers import quantile_balancing as qb
 from maxtext.layers.initializers import NdInitializer, default_bias_init, nd_dense_init
 from maxtext.utils import max_logging
 from maxtext.utils import max_utils
@@ -1189,7 +1191,7 @@ class RoutedMoE(nnx.Module):
     self.up_activation_fn = linears._convert_to_activation_function(self.up_activation_name)
     self.is_situ_glu = (self.config.mlp_activations[0], self.up_activation_name) == ("situ_gate", "situ_linear")
     if self.up_activation_name != "linear" and (
-        self.config.te_moe_block or self.config.attention in ("vllm_rpa", "vllm_batched_rpa")
+        (self.config.te_moe_block and not self.is_situ_glu) or self.config.attention in ("vllm_rpa", "vllm_batched_rpa")
     ):
       raise ValueError(
           f"mlp_activations[1]={self.up_activation_name!r} is not supported by the fused MoE kernels"
@@ -1500,7 +1502,8 @@ class RoutedMoE(nnx.Module):
         router_probs = jax.nn.softmax(gate_logits.astype(jnp.float32), axis=-1)
         top_k_weights = jnp.take_along_axis(router_probs, gather_indices, axis=-1).astype(self.dtype)
       else:
-        top_k_weights = jnp.take_along_axis(gate_logits, gather_indices, axis=-1)
+        routing_scores = pre_bias_logits if qb.enabled(self.config) else gate_logits
+        top_k_weights = jnp.take_along_axis(routing_scores, gather_indices, axis=-1)
     else:
       # TE randomizes logits before scoring; retain normal top-k selection here.
       # Native JAX retains its existing random expert-ID selection.
@@ -5208,6 +5211,9 @@ class RoutedMoE(nnx.Module):
       routing_indices: jax.Array | None = None,
       routing_weights: jax.Array | None = None,
       out_sharding: NamedSharding | None = None,
+      router_input: jax.Array | None = None,
+      collect_qb: bool = False,
+      qb_token_mask: jax.Array | None = None,
   ) -> tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]:
     """Run TransformerEngine's fused EP MoEBlock using MaxText-owned params."""
     try:
@@ -5219,7 +5225,12 @@ class RoutedMoE(nnx.Module):
           "Please upgrade to the latest version of TransformerEngine."
       ) from exc
 
-    if self.quant is None or not hasattr(self.quant, "get_moe_block_quantizer_sets"):
+    quant = self.quant
+    if quant is None:
+      quant = quantizations.TransformerEngineQuantization(
+          SimpleNamespace(quantization="te_no_quant", te_comm_gemm_overlap=self.config.te_comm_gemm_overlap)
+      )
+    if not hasattr(quant, "get_moe_block_quantizer_sets"):
       raise ValueError("te_moe_block=True requires TransformerEngine quantization or te_gmm_quantization=te_no_quant.")
     if self.is_hash_routing and (routing_indices is None or routing_weights is None):
       raise ValueError("TE MoE hash routing requires precomputed routing indices and weights.")
@@ -5236,7 +5247,7 @@ class RoutedMoE(nnx.Module):
     if self.num_experts % ep_size != 0:
       raise ValueError(f"num_experts={self.num_experts} must be divisible by EP size={ep_size}.")
 
-    fc1_quantizer_set, fc2_quantizer_set = self.quant.get_moe_block_quantizer_sets(
+    fc1_quantizer_set, fc2_quantizer_set = quant.get_moe_block_quantizer_sets(
         self.config.te_gmm_quantization,
         # Dispatch buffers have one group per (fsdp, ep, local_expert),
         # while model weights retain their global expert-group descriptor.
@@ -5313,6 +5324,39 @@ class RoutedMoE(nnx.Module):
           "collect_expert_counts": self.should_update_load_balance(),
       }
 
+      if collect_qb or router_input is not None:
+        computed_router = router_kwargs["router_info"]
+        fields = inspect.signature(te_moe.RouterComputationInfo).parameters
+        updates = {}
+        if router_input is not None:
+          if "router_input" not in fields:
+            raise ValueError("Installed TE lacks separate router_input support.")
+          updates.update(
+              router_input=router_input, router_input_axes=("activation_batch", "activation_norm_length", None)
+          )
+        if collect_qb:
+          if "qb_bin_bounds" not in fields or "qb_token_mask" not in fields:
+            raise ValueError("Installed TE lacks QB histogram/mask support.")
+          updates.update(
+              qb_bin_bounds=qb.bin_bounds(expert_bias),
+              qb_token_mask=qb_token_mask,
+              qb_num_bins=self.config.moe_qb_num_bins,
+              qb_histogram_mode=self.config.moe_qb_histogram_mode,
+          )
+        router_kwargs["router_info"] = computed_router.replace(**updates)
+
+    parallel_kwargs = {}
+    te_parameters = inspect.signature(te_moe.moe).parameters
+    if "mesh_resource" in te_parameters:
+      parallel_kwargs["mesh_resource"] = MeshResource(
+          dp_resource="data", fsdp_resource="fsdp", ep_resource=self._expert_parallelism_name
+      )
+    else:
+      parallel_kwargs.update(ep_axis=self._expert_parallelism_name, data_parallelism_axes=("data", "fsdp"))
+    if "quant_before_fsdp_ag" in te_parameters:
+      parallel_kwargs["quant_before_fsdp_ag"] = self.config.te_moe_quantize_before_fsdp_all_gather
+    activation_type = "situglu" if self.is_situ_glu else self.config.mlp_activations[0]
+
     # Pass the weights by keyword: the older interface has gate_kernel in the second positional slot.
     te_moe_outputs = te_moe.moe(
         inputs,
@@ -5322,26 +5366,29 @@ class RoutedMoE(nnx.Module):
         wi_1_bias=w1_bias,
         wo_bias=wo_bias,
         num_experts=self.num_experts,
-        activation_type=self.config.mlp_activations[0],
-        apply_topk_weights_early=True,
+        activation_type=activation_type,
+        apply_topk_weights_early=not self.is_situ_glu,
         quantizer_sets=(fc1_quantizer_set, fc2_quantizer_set),
-        mesh_resource=MeshResource(dp_resource="data", fsdp_resource="fsdp", ep_resource=self._expert_parallelism_name),
         input_axes=("activation_batch", "activation_norm_length", None),
         wi_kernel_axes=self.wi_kernel_axes,
         wo_kernel_axes=self.wo_kernel_axes,
         dtype=self.dtype,
         recv_capacity_per_rank=max_utils.get_te_moe_recv_capacity_per_rank(),
-        quant_before_fsdp_ag=self.config.te_moe_quantize_before_fsdp_all_gather,
         **router_kwargs,
+        **parallel_kwargs,
         **cudnn_gmm_fusion_kwargs,
         **weight_layout_kwargs,
         **checkpoint_kwargs,
     )
     if supports_router_info:
-      output, lb_loss, total_recv_tokens, expert_counts = te_moe_outputs
+      output, lb_loss, total_recv_tokens, expert_counts = te_moe_outputs[:4]
     else:
       output, lb_loss, total_recv_tokens = te_moe_outputs
       expert_counts = None
+    if collect_qb:
+      if len(te_moe_outputs) != 5:
+        raise ValueError("TE QB must return per-shard histograms as its fifth result.")
+      qb.record(self, te_moe_outputs[4])
     recv_capacity_per_rank = max_utils.get_te_moe_recv_capacity_per_rank()
     output = output.astype(self.dtype)
     if lb_loss is not None:
@@ -5370,6 +5417,8 @@ class RoutedMoE(nnx.Module):
       gate_inputs: jax.Array | None = None,
       out_sharding: NamedSharding | None = None,
       forced_routed_experts: jax.Array | None = None,
+      collect_qb: bool = False,
+      qb_token_mask: jax.Array | None = None,
   ) -> tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]]:
     """Executes the routed MoE block.
 
@@ -5385,10 +5434,19 @@ class RoutedMoE(nnx.Module):
       and any routed bias updates.
     """
     cfg = self.config
-    if cfg.te_moe_block and gate_inputs is not None:
-      raise ValueError("te_moe_block=True does not support separate gate_inputs.")
     if cfg.te_moe_block and cfg.use_random_routing and forced_routed_experts is not None:
       raise ValueError("Fixed random routing does not support forced expert indices.")
+    inputs = inputs.astype(cfg.dtype)
+
+    if collect_qb:
+      if not qb.enabled(cfg):
+        raise ValueError("collect_qb requires moe_quantile_balancing=true.")
+      if forced_routed_experts is not None:
+        raise ValueError("QB does not support forced debug routes.")
+      if qb_token_mask is not None:
+        if qb_token_mask.shape != inputs.shape[:-1] or qb_token_mask.dtype != jnp.bool_:
+          raise ValueError("QB token mask must be boolean with the input batch/sequence shape.")
+
     if gate_inputs is None and self.moe_router_input_dim != self.moe_expert_input_dim:
       raise ValueError(
           f"moe_router_input_dim={self.moe_router_input_dim} differs from the expert input dim"
@@ -5412,8 +5470,13 @@ class RoutedMoE(nnx.Module):
             self.rngs,
             input_ids=input_ids,
         )
-      gate_kernel = jnp.asarray(self.gate.kernel[...], self.dtype)
-      wi_kernel = jnp.asarray(self.wi[...], self.dtype)
+      gate_kernel = jnp.asarray(self.gate.kernel[...], gate_dtype if gate_inputs is not None else self.dtype)
+      if cfg.prefuse_moe_weights:
+        wi_kernel = jnp.asarray(self.wi[...], self.dtype)
+      else:
+        wi_kernel = jnp.concatenate(
+            (jnp.asarray(self.wi_0[...], self.dtype), jnp.asarray(self.wi_1[...], self.dtype)), axis=-1
+        )
       wo_kernel = jnp.asarray(self.wo[...], self.dtype)
       if self.per_expert_scale is not None:
         wo_kernel = wo_kernel * jnp.asarray(self.per_expert_scale[...], self.dtype)[:, None, None]
@@ -5434,9 +5497,22 @@ class RoutedMoE(nnx.Module):
           routing_indices=routing_indices,
           routing_weights=routing_weights,
           out_sharding=out_sharding,
+          router_input=routing_inputs if gate_inputs is not None else None,
+          collect_qb=collect_qb,
+          qb_token_mask=qb_token_mask,
       )
 
     gate_logits, pre_bias_logits = self.gate(routing_inputs)
+    if collect_qb:
+      forced_routed_experts, counts = qb.route_and_observe(
+          gate_logits,
+          pre_bias_logits,
+          self.gate.bias.value,
+          qb_token_mask,
+          self.num_experts_per_tok,
+          cfg.moe_qb_num_bins,
+      )
+      qb.record(self, counts)
 
     is_fused_moe_path = cfg.attention in ("vllm_rpa", "vllm_batched_rpa") and not self.is_hash_routing
 
